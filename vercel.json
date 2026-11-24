@@ -1,0 +1,27 @@
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "devCommand": "npx expo start --web",
+  "rewrites": [
+    {
+      "source": "/apresentacao",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/apresentacao/:path*",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/slides",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/slides/:path*",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/((?!_expo|assets|favicon\\.ico).*)",
+      "destination": "/index.html"
+    }
+  ]
+}
