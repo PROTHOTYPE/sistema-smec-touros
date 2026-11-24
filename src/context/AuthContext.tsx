@@ -283,6 +283,19 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     });
 
     if (signInError || !data?.user) {
+      const errMsg = (signInError?.message || '').toLowerCase();
+      if (
+        errMsg.includes('fetch') ||
+        errMsg.includes('network') ||
+        errMsg.includes('timeout') ||
+        errMsg.includes('load failed')
+      ) {
+        return {
+          success: false,
+          message:
+            'Não foi possível conectar ao servidor de autenticação no momento. Aguarde alguns instantes e tente novamente.',
+        };
+      }
       return {
         success: false,
         message: 'E-mail ou senha inválidos. Verifique suas credenciais ou solicite seu acesso.',

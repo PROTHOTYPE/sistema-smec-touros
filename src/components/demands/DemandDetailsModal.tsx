@@ -7,7 +7,8 @@ import {
   TouchableOpacity, 
   Image, 
   Alert, 
-  Linking 
+  Linking,
+  Platform,
 } from 'react-native';
 import { 
   Building2, 
@@ -113,9 +114,39 @@ export const DemandDetailsModal: React.FC<DemandDetailsModalProps> = ({
     onClose();
   };
 
+  const isSafeAttachmentUri = (uri?: string | null): boolean => {
+    if (!uri) return false;
+    const trimmed = uri.trim();
+    return (
+      /^https?:\/\//i.test(trimmed) ||
+      /^blob:/i.test(trimmed) ||
+      /^file:\/\//i.test(trimmed) ||
+      /^content:\/\//i.test(trimmed) ||
+      /^data:(image\/(png|jpeg|jpg|webp|gif)|application\/pdf);base64,/i.test(trimmed)
+    );
+  };
+
   const handleOpenAttachment = (uri: string) => {
-    Linking.openURL(uri).catch(() => {
-      setPreviewImageUri(uri);
+    const trimmed = (uri || '').trim();
+    if (!isSafeAttachmentUri(trimmed)) {
+      Alert.alert('Anexo bloqueado', 'O formato ou protocolo deste anexo não é permitido por segurança.');
+      return;
+    }
+
+    if (/^data:image\//i.test(trimmed)) {
+      setPreviewImageUri(trimmed);
+      return;
+    }
+
+    if (Platform.OS === 'web' && typeof window !== 'undefined' && /^https?:\/\//i.test(trimmed)) {
+      window.open(trimmed, '_blank', 'noopener,noreferrer');
+      return;
+    }
+
+    Linking.openURL(trimmed).catch(() => {
+      if (/^data:image\//i.test(trimmed) || /^https?:\/\//i.test(trimmed)) {
+        setPreviewImageUri(trimmed);
+      }
     });
   };
 
@@ -265,7 +296,7 @@ export const DemandDetailsModal: React.FC<DemandDetailsModalProps> = ({
                         onPress={() => handleOpenAttachment(att.fileUri)}
                         style={styles.attCard}
                       >
-                        {att.fileType === 'image' ? (
+                        {att.fileType === 'image' && isSafeAttachmentUri(att.fileUri) ? (
                           <Image source={{ uri: att.fileUri }} style={styles.attImg} />
                         ) : (
                           <View style={styles.attFileIcon}>

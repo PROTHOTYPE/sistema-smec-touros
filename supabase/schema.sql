@@ -168,28 +168,59 @@ CREATE INDEX IF NOT EXISTS idx_demands_status ON public.demands(status);
 CREATE INDEX IF NOT EXISTS idx_oficios_protocol_sector ON public.oficios_protocol(sector_id);
 CREATE INDEX IF NOT EXISTS idx_profiles_sector ON public.profiles(sector_id);
 
--- 7. Funções auxiliares (SECURITY DEFINER para evitar recursão em políticas RLS)
+-- 7. Schema privado e funções auxiliares (SECURITY DEFINER fora do schema exposto na API)
 
-create or replace function public.current_system_role()
-returns text as $$ select system_role from public.profiles where id = auth.uid() limit 1; $$ language sql stable security definer set search_path = public;
+CREATE SCHEMA IF NOT EXISTS private_security;
+REVOKE ALL ON SCHEMA private_security FROM PUBLIC, anon;
+GRANT USAGE ON SCHEMA private_security TO authenticated, service_role, postgres;
 
-create or replace function public.current_sector_id()
-returns text as $$ select sector_id from public.profiles where id = auth.uid() limit 1; $$ language sql stable security definer set search_path = public;
+CREATE OR REPLACE FUNCTION private_security.current_system_role()
+RETURNS text
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT system_role FROM public.profiles WHERE id = (SELECT auth.uid()) LIMIT 1;
+$$;
 
-create or replace function public.current_user_status()
-returns text as $$ select status from public.profiles where id = auth.uid() limit 1; $$ language sql stable security definer set search_path = public;
+CREATE OR REPLACE FUNCTION private_security.current_sector_id()
+RETURNS text
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT sector_id FROM public.profiles WHERE id = (SELECT auth.uid()) LIMIT 1;
+$$;
+
+CREATE OR REPLACE FUNCTION private_security.current_user_status()
+RETURNS text
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT status FROM public.profiles WHERE id = (SELECT auth.uid()) LIMIT 1;
+$$;
+
+REVOKE ALL ON FUNCTION private_security.current_system_role() FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION private_security.current_sector_id() FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION private_security.current_user_status() FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION private_security.current_system_role() TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION private_security.current_sector_id() TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION private_security.current_user_status() TO authenticated, service_role;
 
 -- 8. Provisionamento automático de perfil após signup no Supabase Auth
 
--- Revoga qualquer permissão de INSERT direto pelo cliente em public.profiles
 REVOKE INSERT ON public.profiles FROM anon, authenticated;
 
-create or replace function public.handle_new_user()
-returns trigger
-language plpgsql
-security definer
-set search_path = public
-as $$
+CREATE OR REPLACE FUNCTION private_security.handle_new_user()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
 declare
   v_raw_sector text;
   v_canonical_sector text;
@@ -200,7 +231,6 @@ begin
   v_job_title := coalesce(nullif(trim(new.raw_user_meta_data->>'job_title'), ''), 'Servidor Público');
   v_raw_sector := coalesce(nullif(trim(new.raw_user_meta_data->>'sector_id'), ''), 'pedagogico');
 
-  -- Normaliza sector_id para garantir compatibilidade estrita com a FK public.sectors(id)
   select s.id into v_canonical_sector
   from public.sectors s
   where lower(s.id) = lower(v_raw_sector)
@@ -214,21 +244,8 @@ begin
   -- Substitua pelo e-mail institucional do administrador inicial antes de executar em um novo ambiente
   if lower(trim(new.email)) = 'admin.ti@smec.exemplo.gov.br' then
     insert into public.profiles (
-      id,
-      full_name,
-      name,
-      email,
-      job_title,
-      cargo,
-      sector_id,
-      sector_role,
-      coordination_subarea,
-      system_role,
-      role,
-      status,
-      created_at,
-      approved_at,
-      approved_by
+      id, full_name, name, email, job_title, cargo, sector_id, sector_role,
+      coordination_subarea, system_role, role, status, created_at, approved_at, approved_by
     ) values (
       new.id,
       coalesce(nullif(v_full_name, 'Novo Servidor'), 'Coordenação TI-SMEC'),
@@ -248,20 +265,8 @@ begin
     );
   else
     insert into public.profiles (
-      id,
-      full_name,
-      name,
-      email,
-      job_title,
-      cargo,
-      sector_id,
-      sector_role,
-      system_role,
-      role,
-      status,
-      created_at,
-      approved_at,
-      approved_by
+      id, full_name, name, email, job_title, cargo, sector_id, sector_role,
+      system_role, role, status, created_at, approved_at, approved_by
     ) values (
       new.id,
       v_full_name,
@@ -284,20 +289,21 @@ begin
 end;
 $$;
 
-drop trigger if exists on_auth_user_created on auth.users;
-create trigger on_auth_user_created
-  after insert on auth.users
-  for each row execute procedure public.handle_new_user();
+REVOKE ALL ON FUNCTION private_security.handle_new_user() FROM PUBLIC, anon, authenticated;
+
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE PROCEDURE private_security.handle_new_user();
 
 -- 9. Triggers de proteção contra escalonamento de privilégios e alteração de auditoria
 
--- Impede alteração de colunas de permissão/status por sessões não-administradoras
-create or replace function public.prevent_profile_privilege_escalation()
-returns trigger
-language plpgsql
-security definer
-set search_path = public
-as $$
+CREATE OR REPLACE FUNCTION private_security.prevent_profile_privilege_escalation()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, private_security
+AS $$
 begin
   -- Mantém a conta mestre protegida contra rebaixamento acidental (ajuste o e-mail no seu ambiente)
   if lower(trim(old.email)) = 'admin.ti@smec.exemplo.gov.br' then
@@ -307,8 +313,7 @@ begin
     new.sector_id := 'suporte_ti';
   end if;
 
-  -- Quando executado por sessão autenticada que não seja SUPER_ADMIN_TI, bloqueia alteração de colunas sensíveis
-  if auth.uid() is not null and coalesce(upper(public.current_system_role()), '') <> 'SUPER_ADMIN_TI' then
+  if (select auth.uid()) is not null and coalesce(upper(private_security.current_system_role()), '') <> 'SUPER_ADMIN_TI' then
     if new.system_role is distinct from old.system_role
        or new.role is distinct from old.role
        or new.sector_id is distinct from old.sector_id
@@ -327,18 +332,20 @@ begin
 end;
 $$;
 
-drop trigger if exists trg_prevent_profile_privilege_escalation on public.profiles;
-create trigger trg_prevent_profile_privilege_escalation
-  before update on public.profiles
-  for each row execute procedure public.prevent_profile_privilege_escalation();
+REVOKE ALL ON FUNCTION private_security.prevent_profile_privilege_escalation() FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION private_security.prevent_profile_privilege_escalation() TO authenticated, service_role;
 
--- 9.2 Trigger BEFORE UPDATE em public.demands: impede adulteração de metadados de auditoria
-create or replace function public.prevent_demand_audit_tampering()
-returns trigger
-language plpgsql
-security definer
-set search_path = public
-as $$
+DROP TRIGGER IF EXISTS trg_prevent_profile_privilege_escalation ON public.profiles;
+CREATE TRIGGER trg_prevent_profile_privilege_escalation
+  BEFORE UPDATE ON public.profiles
+  FOR EACH ROW EXECUTE PROCEDURE private_security.prevent_profile_privilege_escalation();
+
+CREATE OR REPLACE FUNCTION private_security.prevent_demand_audit_tampering()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
 begin
   if new.id is distinct from old.id
      or new.protocol_number is distinct from old.protocol_number
@@ -354,10 +361,13 @@ begin
 end;
 $$;
 
-drop trigger if exists trg_prevent_demand_audit_tampering on public.demands;
-create trigger trg_prevent_demand_audit_tampering
-  before update on public.demands
-  for each row execute procedure public.prevent_demand_audit_tampering();
+REVOKE ALL ON FUNCTION private_security.prevent_demand_audit_tampering() FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION private_security.prevent_demand_audit_tampering() TO authenticated, service_role;
+
+DROP TRIGGER IF EXISTS trg_prevent_demand_audit_tampering ON public.demands;
+CREATE TRIGGER trg_prevent_demand_audit_tampering
+  BEFORE UPDATE ON public.demands
+  FOR EACH ROW EXECUTE PROCEDURE private_security.prevent_demand_audit_tampering();
 
 -- 10. Row Level Security (RLS)
 
@@ -374,15 +384,16 @@ DROP POLICY IF EXISTS "profiles_select_policy" ON public.profiles;
 CREATE POLICY "profiles_select_policy"
   ON public.profiles
   FOR SELECT
+  TO authenticated
   USING (
-    id = auth.uid()
+    id = (SELECT auth.uid())
     OR (
-      public.current_user_status() = 'approved'
+      private_security.current_user_status() = 'approved'
       AND (
-        UPPER(public.current_system_role()) IN ('SUPER_ADMIN_TI', 'EXECUTIVO_GESTAO', 'TRIAGEM_ADMIN_RH')
+        UPPER(private_security.current_system_role()) IN ('SUPER_ADMIN_TI', 'EXECUTIVO_GESTAO', 'TRIAGEM_ADMIN_RH')
         OR (
-          UPPER(public.current_system_role()) = 'COORD_MEMBRO_SETOR'
-          AND sector_id = public.current_sector_id()
+          UPPER(private_security.current_system_role()) = 'COORD_MEMBRO_SETOR'
+          AND sector_id = private_security.current_sector_id()
         )
       )
     )
@@ -395,24 +406,25 @@ DROP POLICY IF EXISTS "profiles_update_policy" ON public.profiles;
 CREATE POLICY "profiles_update_policy"
   ON public.profiles
   FOR UPDATE
+  TO authenticated
   USING (
     (
-      public.current_user_status() = 'approved'
-      AND UPPER(public.current_system_role()) = 'SUPER_ADMIN_TI'
+      private_security.current_user_status() = 'approved'
+      AND UPPER(private_security.current_system_role()) = 'SUPER_ADMIN_TI'
     )
     OR (
-      id = auth.uid()
-      AND public.current_user_status() = 'approved'
+      id = (SELECT auth.uid())
+      AND private_security.current_user_status() = 'approved'
     )
   )
   WITH CHECK (
     (
-      public.current_user_status() = 'approved'
-      AND UPPER(public.current_system_role()) = 'SUPER_ADMIN_TI'
+      private_security.current_user_status() = 'approved'
+      AND UPPER(private_security.current_system_role()) = 'SUPER_ADMIN_TI'
     )
     OR (
-      id = auth.uid()
-      AND public.current_user_status() = 'approved'
+      id = (SELECT auth.uid())
+      AND private_security.current_user_status() = 'approved'
     )
   );
 
@@ -420,9 +432,10 @@ DROP POLICY IF EXISTS "profiles_delete_policy" ON public.profiles;
 CREATE POLICY "profiles_delete_policy"
   ON public.profiles
   FOR DELETE
+  TO authenticated
   USING (
-    public.current_user_status() = 'approved'
-    AND UPPER(public.current_system_role()) = 'SUPER_ADMIN_TI'
+    private_security.current_user_status() = 'approved'
+    AND UPPER(private_security.current_system_role()) = 'SUPER_ADMIN_TI'
   );
 
 -- Políticas de public.demands (isolamento por setor)
@@ -431,12 +444,13 @@ DROP POLICY IF EXISTS "demands_select_policy" ON public.demands;
 CREATE POLICY "demands_select_policy"
   ON public.demands
   FOR SELECT
+  TO authenticated
   USING (
-    public.current_user_status() = 'approved'
+    private_security.current_user_status() = 'approved'
     AND (
-      UPPER(public.current_system_role()) IN ('SUPER_ADMIN_TI', 'EXECUTIVO_GESTAO')
+      UPPER(private_security.current_system_role()) IN ('SUPER_ADMIN_TI', 'EXECUTIVO_GESTAO')
       OR (
-        UPPER(public.current_system_role()) = 'TRIAGEM_ADMIN_RH'
+        UPPER(private_security.current_system_role()) = 'TRIAGEM_ADMIN_RH'
         AND (
           public.demands.sector_id = 'admin_rh'
           OR public.demands.source_sector_id = 'admin_rh'
@@ -445,8 +459,8 @@ CREATE POLICY "demands_select_policy"
         )
       )
       OR (
-        UPPER(public.current_system_role()) = 'COORD_MEMBRO_SETOR'
-        AND public.demands.sector_id = public.current_sector_id()
+        UPPER(private_security.current_system_role()) = 'COORD_MEMBRO_SETOR'
+        AND public.demands.sector_id = private_security.current_sector_id()
       )
     )
   );
@@ -455,20 +469,21 @@ DROP POLICY IF EXISTS "demands_insert_policy" ON public.demands;
 CREATE POLICY "demands_insert_policy"
   ON public.demands
   FOR INSERT
+  TO authenticated
   WITH CHECK (
-    public.current_user_status() = 'approved'
-    AND public.demands.created_by = auth.uid()::text
+    private_security.current_user_status() = 'approved'
+    AND public.demands.created_by = (SELECT auth.uid())::text
     AND (
-      UPPER(public.current_system_role()) IN ('SUPER_ADMIN_TI', 'TRIAGEM_ADMIN_RH')
+      UPPER(private_security.current_system_role()) IN ('SUPER_ADMIN_TI', 'TRIAGEM_ADMIN_RH')
       OR (
-        UPPER(public.current_system_role()) = 'EXECUTIVO_GESTAO'
+        UPPER(private_security.current_system_role()) = 'EXECUTIVO_GESTAO'
         AND public.demands.origin_type IN ('atribuida_admin', 'direta_setor')
       )
       OR (
-        UPPER(public.current_system_role()) = 'COORD_MEMBRO_SETOR'
+        UPPER(private_security.current_system_role()) = 'COORD_MEMBRO_SETOR'
         AND public.demands.origin_type = 'direta_setor'
-        AND public.demands.target_sector_id = public.current_sector_id()
-        AND public.demands.source_sector_id = public.current_sector_id()
+        AND public.demands.target_sector_id = private_security.current_sector_id()
+        AND public.demands.source_sector_id = private_security.current_sector_id()
       )
     )
   );
@@ -477,12 +492,13 @@ DROP POLICY IF EXISTS "demands_update_policy" ON public.demands;
 CREATE POLICY "demands_update_policy"
   ON public.demands
   FOR UPDATE
+  TO authenticated
   USING (
-    public.current_user_status() = 'approved'
+    private_security.current_user_status() = 'approved'
     AND (
-      UPPER(public.current_system_role()) = 'SUPER_ADMIN_TI'
+      UPPER(private_security.current_system_role()) = 'SUPER_ADMIN_TI'
       OR (
-        UPPER(public.current_system_role()) = 'TRIAGEM_ADMIN_RH'
+        UPPER(private_security.current_system_role()) = 'TRIAGEM_ADMIN_RH'
         AND (
           public.demands.sector_id = 'admin_rh'
           OR public.demands.source_sector_id = 'admin_rh'
@@ -490,16 +506,16 @@ CREATE POLICY "demands_update_policy"
         )
       )
       OR (
-        public.demands.sector_id = public.current_sector_id()
+        public.demands.sector_id = private_security.current_sector_id()
       )
     )
   )
   WITH CHECK (
-    public.current_user_status() = 'approved'
+    private_security.current_user_status() = 'approved'
     AND (
-      UPPER(public.current_system_role()) = 'SUPER_ADMIN_TI'
+      UPPER(private_security.current_system_role()) = 'SUPER_ADMIN_TI'
       OR (
-        UPPER(public.current_system_role()) = 'TRIAGEM_ADMIN_RH'
+        UPPER(private_security.current_system_role()) = 'TRIAGEM_ADMIN_RH'
         AND (
           public.demands.sector_id = 'admin_rh'
           OR public.demands.source_sector_id = 'admin_rh'
@@ -507,7 +523,7 @@ CREATE POLICY "demands_update_policy"
         )
       )
       OR (
-        public.demands.sector_id = public.current_sector_id()
+        public.demands.sector_id = private_security.current_sector_id()
       )
     )
   );
@@ -516,27 +532,30 @@ DROP POLICY IF EXISTS "demands_delete_governance_policy" ON public.demands;
 CREATE POLICY "demands_delete_governance_policy"
   ON public.demands
   FOR DELETE
+  TO authenticated
   USING (
-    public.current_user_status() = 'approved'
-    AND UPPER(public.current_system_role()) IN ('SUPER_ADMIN_TI', 'TRIAGEM_ADMIN_RH')
+    private_security.current_user_status() = 'approved'
+    AND UPPER(private_security.current_system_role()) IN ('SUPER_ADMIN_TI', 'TRIAGEM_ADMIN_RH')
   );
 
--- View Segura com Mascaramento de Dados Sensíveis (LGPD / Sigilo Psicossocial)
-CREATE OR REPLACE VIEW public.demands_panoramic_view AS
+-- View segura com security_invoker = true (respeitando o RLS de public.demands) e mascaramento LGPD
+CREATE OR REPLACE VIEW public.demands_panoramic_view
+WITH (security_invoker = true)
+AS
 SELECT
   d.id,
   d.protocol_number,
   CASE
     WHEN d.is_confidential = TRUE
-      AND d.target_sector_id <> public.current_sector_id()
-      AND UPPER(public.current_system_role()) <> 'SUPER_ADMIN_TI'
+      AND d.target_sector_id <> private_security.current_sector_id()
+      AND UPPER(private_security.current_system_role()) <> 'SUPER_ADMIN_TI'
     THEN '[ATENDIMENTO SIGILOSO — ACESSO RESTRITO AO SETOR]'
     ELSE d.title
   END AS title,
   CASE
     WHEN d.is_confidential = TRUE
-      AND d.target_sector_id <> public.current_sector_id()
-      AND UPPER(public.current_system_role()) <> 'SUPER_ADMIN_TI'
+      AND d.target_sector_id <> private_security.current_sector_id()
+      AND UPPER(private_security.current_system_role()) <> 'SUPER_ADMIN_TI'
     THEN 'Conteúdo protegido por sigilo profissional (LGPD).'
     ELSE d.description
   END AS description,
@@ -559,22 +578,22 @@ SELECT
   d.oficio_received_by,
   CASE
     WHEN d.is_confidential = TRUE
-      AND d.target_sector_id <> public.current_sector_id()
-      AND UPPER(public.current_system_role()) <> 'SUPER_ADMIN_TI'
+      AND d.target_sector_id <> private_security.current_sector_id()
+      AND UPPER(private_security.current_system_role()) <> 'SUPER_ADMIN_TI'
     THEN NULL
     ELSE d.resolution_summary
   END AS resolution_summary,
   CASE
     WHEN d.is_confidential = TRUE
-      AND d.target_sector_id <> public.current_sector_id()
-      AND UPPER(public.current_system_role()) <> 'SUPER_ADMIN_TI'
+      AND d.target_sector_id <> private_security.current_sector_id()
+      AND UPPER(private_security.current_system_role()) <> 'SUPER_ADMIN_TI'
     THEN NULL
     ELSE d.bottleneck_reason
   END AS bottleneck_reason,
   CASE
     WHEN d.is_confidential = TRUE
-      AND d.target_sector_id <> public.current_sector_id()
-      AND UPPER(public.current_system_role()) <> 'SUPER_ADMIN_TI'
+      AND d.target_sector_id <> private_security.current_sector_id()
+      AND UPPER(private_security.current_system_role()) <> 'SUPER_ADMIN_TI'
     THEN NULL
     ELSE d.impediment_reason
   END AS impediment_reason,
@@ -582,19 +601,23 @@ SELECT
   d.is_confidential
 FROM public.demands d;
 
+REVOKE ALL ON public.demands_panoramic_view FROM PUBLIC, anon;
+GRANT SELECT ON public.demands_panoramic_view TO authenticated, service_role;
+
 -- Políticas de public.oficios_protocol
 
 DROP POLICY IF EXISTS "oficios_protocol_select_policy" ON public.oficios_protocol;
 CREATE POLICY "oficios_protocol_select_policy"
   ON public.oficios_protocol
   FOR SELECT
+  TO authenticated
   USING (
-    public.current_user_status() = 'approved'
+    private_security.current_user_status() = 'approved'
     AND (
-      UPPER(public.current_system_role()) IN ('SUPER_ADMIN_TI', 'EXECUTIVO_GESTAO', 'TRIAGEM_ADMIN_RH')
+      UPPER(private_security.current_system_role()) IN ('SUPER_ADMIN_TI', 'EXECUTIVO_GESTAO', 'TRIAGEM_ADMIN_RH')
       OR (
-        UPPER(public.current_system_role()) = 'COORD_MEMBRO_SETOR'
-        AND public.oficios_protocol.sector_id = public.current_sector_id()
+        UPPER(private_security.current_system_role()) = 'COORD_MEMBRO_SETOR'
+        AND public.oficios_protocol.sector_id = private_security.current_sector_id()
       )
     )
   );
@@ -603,33 +626,35 @@ DROP POLICY IF EXISTS "oficios_protocol_insert_policy" ON public.oficios_protoco
 CREATE POLICY "oficios_protocol_insert_policy"
   ON public.oficios_protocol
   FOR INSERT
+  TO authenticated
   WITH CHECK (
-    public.current_user_status() = 'approved'
-    AND public.oficios_protocol.created_by = auth.uid()::text
-    AND UPPER(public.current_system_role()) IN ('SUPER_ADMIN_TI', 'TRIAGEM_ADMIN_RH')
+    private_security.current_user_status() = 'approved'
+    AND public.oficios_protocol.created_by = (SELECT auth.uid())::text
+    AND UPPER(private_security.current_system_role()) IN ('SUPER_ADMIN_TI', 'TRIAGEM_ADMIN_RH')
   );
 
 DROP POLICY IF EXISTS "oficios_protocol_update_policy" ON public.oficios_protocol;
 CREATE POLICY "oficios_protocol_update_policy"
   ON public.oficios_protocol
   FOR UPDATE
+  TO authenticated
   USING (
-    public.current_user_status() = 'approved'
+    private_security.current_user_status() = 'approved'
     AND (
-      UPPER(public.current_system_role()) IN ('SUPER_ADMIN_TI', 'TRIAGEM_ADMIN_RH')
+      UPPER(private_security.current_system_role()) IN ('SUPER_ADMIN_TI', 'TRIAGEM_ADMIN_RH')
       OR (
-        UPPER(public.current_system_role()) = 'COORD_MEMBRO_SETOR'
-        AND public.oficios_protocol.sector_id = public.current_sector_id()
+        UPPER(private_security.current_system_role()) = 'COORD_MEMBRO_SETOR'
+        AND public.oficios_protocol.sector_id = private_security.current_sector_id()
       )
     )
   )
   WITH CHECK (
-    public.current_user_status() = 'approved'
+    private_security.current_user_status() = 'approved'
     AND (
-      UPPER(public.current_system_role()) IN ('SUPER_ADMIN_TI', 'TRIAGEM_ADMIN_RH')
+      UPPER(private_security.current_system_role()) IN ('SUPER_ADMIN_TI', 'TRIAGEM_ADMIN_RH')
       OR (
-        UPPER(public.current_system_role()) = 'COORD_MEMBRO_SETOR'
-        AND public.oficios_protocol.sector_id = public.current_sector_id()
+        UPPER(private_security.current_system_role()) = 'COORD_MEMBRO_SETOR'
+        AND public.oficios_protocol.sector_id = private_security.current_sector_id()
       )
     )
   );
@@ -638,40 +663,42 @@ DROP POLICY IF EXISTS "oficios_protocol_delete_policy" ON public.oficios_protoco
 CREATE POLICY "oficios_protocol_delete_policy"
   ON public.oficios_protocol
   FOR DELETE
+  TO authenticated
   USING (
-    public.current_user_status() = 'approved'
-    AND UPPER(public.current_system_role()) IN ('SUPER_ADMIN_TI', 'TRIAGEM_ADMIN_RH')
+    private_security.current_user_status() = 'approved'
+    AND UPPER(private_security.current_system_role()) IN ('SUPER_ADMIN_TI', 'TRIAGEM_ADMIN_RH')
   );
 
 -- Políticas de public.sectors, public.attachments e public.app_settings
 
--- public.sectors: Leitura pública para listagem oficial dos 15 setores; mutação exclusiva do Super Admin TI
 DROP POLICY IF EXISTS "sectors_select_policy" ON public.sectors;
 CREATE POLICY "sectors_select_policy"
   ON public.sectors
   FOR SELECT
+  TO anon, authenticated
   USING (true);
 
 DROP POLICY IF EXISTS "sectors_modify_policy" ON public.sectors;
 CREATE POLICY "sectors_modify_policy"
   ON public.sectors
   FOR ALL
+  TO authenticated
   USING (
-    public.current_user_status() = 'approved'
-    AND UPPER(public.current_system_role()) = 'SUPER_ADMIN_TI'
+    private_security.current_user_status() = 'approved'
+    AND UPPER(private_security.current_system_role()) = 'SUPER_ADMIN_TI'
   )
   WITH CHECK (
-    public.current_user_status() = 'approved'
-    AND UPPER(public.current_system_role()) = 'SUPER_ADMIN_TI'
+    private_security.current_user_status() = 'approved'
+    AND UPPER(private_security.current_system_role()) = 'SUPER_ADMIN_TI'
   );
 
--- public.attachments: Vinculado à visibilidade da demanda e autoria
 DROP POLICY IF EXISTS "attachments_select_policy" ON public.attachments;
 CREATE POLICY "attachments_select_policy"
   ON public.attachments
   FOR SELECT
+  TO authenticated
   USING (
-    public.current_user_status() = 'approved'
+    private_security.current_user_status() = 'approved'
     AND EXISTS (
       SELECT 1 FROM public.demands d
       WHERE d.id = public.attachments.demand_id
@@ -682,9 +709,10 @@ DROP POLICY IF EXISTS "attachments_insert_policy" ON public.attachments;
 CREATE POLICY "attachments_insert_policy"
   ON public.attachments
   FOR INSERT
+  TO authenticated
   WITH CHECK (
-    public.current_user_status() = 'approved'
-    AND public.attachments.uploaded_by = auth.uid()::text
+    private_security.current_user_status() = 'approved'
+    AND public.attachments.uploaded_by = (SELECT auth.uid())::text
     AND EXISTS (
       SELECT 1 FROM public.demands d
       WHERE d.id = public.attachments.demand_id
@@ -695,27 +723,29 @@ DROP POLICY IF EXISTS "attachments_delete_policy" ON public.attachments;
 CREATE POLICY "attachments_delete_policy"
   ON public.attachments
   FOR DELETE
+  TO authenticated
   USING (
-    public.current_user_status() = 'approved'
-    AND UPPER(public.current_system_role()) IN ('SUPER_ADMIN_TI', 'TRIAGEM_ADMIN_RH')
+    private_security.current_user_status() = 'approved'
+    AND UPPER(private_security.current_system_role()) IN ('SUPER_ADMIN_TI', 'TRIAGEM_ADMIN_RH')
   );
 
--- public.app_settings: Leitura para usuários aprovados; edição exclusiva pelo Super Admin TI
 DROP POLICY IF EXISTS "app_settings_select_policy" ON public.app_settings;
 CREATE POLICY "app_settings_select_policy"
   ON public.app_settings
   FOR SELECT
-  USING (true);
+  TO authenticated
+  USING (private_security.current_user_status() = 'approved');
 
 DROP POLICY IF EXISTS "app_settings_modify_policy" ON public.app_settings;
 CREATE POLICY "app_settings_modify_policy"
   ON public.app_settings
   FOR ALL
+  TO authenticated
   USING (
-    public.current_user_status() = 'approved'
-    AND UPPER(public.current_system_role()) = 'SUPER_ADMIN_TI'
+    private_security.current_user_status() = 'approved'
+    AND UPPER(private_security.current_system_role()) = 'SUPER_ADMIN_TI'
   )
   WITH CHECK (
-    public.current_user_status() = 'approved'
-    AND UPPER(public.current_system_role()) = 'SUPER_ADMIN_TI'
+    private_security.current_user_status() = 'approved'
+    AND UPPER(private_security.current_system_role()) = 'SUPER_ADMIN_TI'
   );

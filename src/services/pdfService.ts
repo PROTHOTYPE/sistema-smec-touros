@@ -8,6 +8,7 @@ export const PdfService = {
       if (Platform.OS === 'web') {
         const printWindow = window.open('', '_blank');
         if (printWindow) {
+          printWindow.opener = null;
           printWindow.document.open();
           printWindow.document.write(html);
           printWindow.document.close();
